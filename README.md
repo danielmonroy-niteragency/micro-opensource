@@ -4,6 +4,18 @@ Dictado local y gratuito para macOS, inspirado en la experiencia de las aplicaci
 
 El audio se procesa en el propio Mac con Whisper y MLX. No se incluye ninguna API de pago ni se envia el audio a un servidor.
 
+## Funciones
+
+- Dictado global manteniendo `Ctrl + Option` o mediante una pulsacion corta.
+- Transcripcion privada en el Mac con Whisper Large V3 Turbo y MLX.
+- Espanol, ingles y deteccion automatica.
+- Selector de microfono y varios atajos configurables.
+- Diccionario personal para nombres, marcas y vocabulario propio.
+- Comandos hablados de puntuacion, parrafos, interrogaciones, exclamaciones y comillas.
+- Historial local, sonidos y restauracion del portapapeles configurables.
+- Copiar, pegar o deshacer la ultima transcripcion desde la barra de menu.
+- Limpieza inteligente opcional con Ollama, tambien local y sin API.
+
 ## Requisitos
 
 - Mac con Apple Silicon (M1 o posterior)
@@ -42,6 +54,18 @@ Se gestionan en `Ajustes del Sistema > Privacidad y seguridad`. Si Accesibilidad
 
 Idiomas incluidos: espanol, ingles y deteccion automatica.
 
+### Limpieza inteligente local opcional
+
+El modo literal funciona sin ningun programa adicional. Para corregir puntuacion y muletillas con un modelo local, instala [Ollama](https://ollama.com/download), abre su aplicacion y activa `Limpieza inteligente local (Ollama)` desde el icono de Dictado.
+
+Por defecto se usa `llama3.2:3b`. Puede elegirse otro modelo antes de abrir Dictado:
+
+```bash
+export DICTADO_OLLAMA_MODEL="nombre-del-modelo"
+```
+
+El modo inteligente es opcional y puede consumir memoria adicional. Si Ollama no responde, Dictado conserva el texto literal para no perder la transcripcion.
+
 ## Privacidad
 
 - El audio se procesa localmente y no se conserva despues de transcribir.
@@ -68,7 +92,8 @@ uv run --python 3.12 dictado.py
 Comprobar la sintaxis:
 
 ```bash
-python3 -m py_compile dictado.py
+python3 -m py_compile dictado.py text_processing.py
+python3 -m unittest discover -s tests -v
 ```
 
 ## Licencia

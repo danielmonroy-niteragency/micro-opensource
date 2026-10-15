@@ -16,7 +16,6 @@ import json
 import math
 import os
 import plistlib
-import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +25,8 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+from text_processing import clean
+
 HOME = Path.home()
 CFG_DIR = HOME / ".dictado"
 CFG_FILE = CFG_DIR / "config.json"
@@ -33,6 +34,7 @@ DICT_FILE = CFG_DIR / "diccionario.txt"
 LOG_FILE = CFG_DIR / "historial.txt"
 AGENT = HOME / "Library/LaunchAgents/com.dictado.app.plist"
 MODEL = os.environ.get("DICTADO_MODEL", "mlx-community/whisper-large-v3-turbo")
+OLLAMA_MODEL = os.environ.get("DICTADO_OLLAMA_MODEL", "llama3.2:3b")
 SAMPLE_RATE = 16000
 TAP_MAX = 0.35  # pulsación más corta que esto = grabación bloqueada
 
@@ -40,8 +42,12 @@ TAP_MAX = 0.35  # pulsación más corta que esto = grabación bloqueada
 def install() -> None:
     dest = HOME / "Dictado"
     dest.mkdir(exist_ok=True)
-    if Path(__file__).resolve() != (dest / "dictado.py").resolve():
-        shutil.copy(__file__, dest / "dictado.py")
+    source_dir = Path(__file__).resolve().parent
+    for filename in ("dictado.py", "text_processing.py"):
+        source = source_dir / filename
+        target = dest / filename
+        if source.resolve() != target.resolve():
+            shutil.copy(source, target)
     uv = shutil.which("uv") or str(HOME / ".local/bin/uv")
     if not Path(uv).exists():
         raise SystemExit(
@@ -172,19 +178,16 @@ KEYS = {
 }
 LANGS = {"es": "Español", "en": "English", "auto": "Automático"}
 
-FILLERS = re.compile(r"\b(?:e+h+m*|e+m+|h?m{2,}|u+h+m*|u+m+)\b[,.]?\s*", re.I)
-COMMANDS = [
-    (re.compile(r"[.,]?\s*\b(?:punto y aparte|nuevo párrafo|new paragraph)\b[.,]?\s*", re.I), ".\n\n"),
-    (re.compile(r"[.,]?\s*\b(?:nueva línea|new line)\b[.,]?\s*", re.I), "\n"),
-]
-HALLUCINATIONS = {
-    "gracias por ver el video", "gracias por ver el vídeo", "gracias", "thanks for watching",
-    "thank you", "subtítulos realizados por la comunidad de amara.org", "you",
-}
-
-
 def load_cfg() -> dict:
-    cfg = {"lang": "es", "key": "ctrl_opt"}
+    cfg = {
+        "lang": "es",
+        "key": "ctrl_opt",
+        "device": None,
+        "history": True,
+        "sounds": True,
+        "restore_clipboard": True,
+        "polish": False,
+    }
     try:
         cfg.update(json.loads(CFG_FILE.read_text()))
     except Exception:
@@ -204,18 +207,6 @@ def dictionary_prompt() -> str | None:
     return ("Vocabulario: " + ", ".join(words) + ".") if words else None
 
 
-def clean(text: str) -> str:
-    text = text.strip()
-    for pat, repl in COMMANDS:
-        text = pat.sub(repl, text)
-    text = FILLERS.sub("", text)
-    text = re.sub(r"\.\.+", ".", text)
-    text = re.sub(r"[ \t]{2,}", " ", text).strip()
-    if re.sub(r"[^\w\s]", "", text).lower().strip() in {re.sub(r"[^\w\s]", "", h) for h in HALLUCINATIONS}:
-        return ""
-    return text
-
-
 def trim(a: np.ndarray) -> np.ndarray | None:
     """Recorta silencios de los extremos; None si no hay voz."""
     f = 320
@@ -230,6 +221,8 @@ def trim(a: np.ndarray) -> np.ndarray | None:
 
 
 def sound(name: str) -> None:
+    if "D" in globals() and not D.cfg.get("sounds", True):
+        return
     subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"])
 
 
@@ -243,21 +236,57 @@ def ax_trusted() -> bool:
     return fn()
 
 
+def polish_locally(text: str) -> str:
+    if not D.cfg.get("polish"):
+        return text
+    ollama = shutil.which("ollama")
+    if not ollama:
+        D.last_error = "Ollama no esta instalado; se uso el texto literal."
+        return text
+    prompt = (
+        "Corrige puntuacion, mayusculas y muletillas del siguiente dictado. "
+        "Conserva exactamente su significado, idioma, nombres, cifras y tono. "
+        "No resumas, no respondas, no anadas informacion y devuelve solo el texto final:\n\n"
+        + text
+    )
+    try:
+        result = subprocess.run(
+            [ollama, "run", OLLAMA_MODEL],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=90,
+            check=False,
+        )
+        polished = clean(result.stdout)
+        if result.returncode == 0 and polished:
+            return polished
+        D.last_error = "Ollama no pudo limpiar el texto; se uso el dictado literal."
+    except subprocess.TimeoutExpired:
+        D.last_error = "Ollama tardo demasiado; se uso el dictado literal."
+    return text
+
+
+def send_command_key(keycode: int) -> None:
+    for down in (True, False):
+        event = CGEventCreateKeyboardEvent(None, keycode, down)
+        CGEventSetFlags(event, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, event)
+
+
 def paste(text: str) -> None:
     env = {**os.environ, "LANG": "en_US.UTF-8"}
     if not ax_trusted():  # sin Accesibilidad no se puede pulsar Cmd+V: se deja en el portapapeles
         subprocess.run(["pbcopy"], input=text.encode(), env=env)
         sound("Glass")
         return
-    prev = subprocess.run(["pbpaste"], capture_output=True, env=env).stdout
+    previous = subprocess.run(["pbpaste"], capture_output=True, env=env).stdout
     subprocess.run(["pbcopy"], input=text.encode(), env=env)
     time.sleep(0.05)
-    for down in (True, False):
-        ev = CGEventCreateKeyboardEvent(None, 9, down)  # 9 = tecla V
-        CGEventSetFlags(ev, kCGEventFlagMaskCommand)
-        CGEventPost(kCGHIDEventTap, ev)
+    send_command_key(9)  # 9 = tecla V
     time.sleep(0.3)
-    subprocess.run(["pbcopy"], input=prev, env=env)
+    if D.cfg.get("restore_clipboard", True):
+        subprocess.run(["pbcopy"], input=previous, env=env)
 
 
 class Dictado:
@@ -271,6 +300,7 @@ class Dictado:
         self.levels: deque[float] = deque([0.0] * 13, maxlen=13)
         self.stream: sd.InputStream | None = None
         self.last_text = ""
+        self.last_error = ""
         self.cw, self.ch = 44.0, 8.0
 
     # --- audio ---
@@ -283,8 +313,20 @@ class Dictado:
         self.chunks.clear()
         self.latched = False
         self.t0 = time.time()
-        self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=self._on_audio)
-        self.stream.start()
+        try:
+            self.stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                device=self.cfg.get("device"),
+                callback=self._on_audio,
+            )
+            self.stream.start()
+        except Exception as exc:
+            self.last_error = f"No se pudo abrir el microfono: {exc}"
+            self.state = "idle"
+            sound("Basso")
+            return
         self.state = "recording"
         sound("Tink")
 
@@ -301,10 +343,16 @@ class Dictado:
 
     # --- transcripción ---
     def _warmup(self) -> None:
-        import mlx_whisper
+        try:
+            import mlx_whisper
 
-        mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), path_or_hf_repo=MODEL)
-        self.state = "idle"
+            mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), path_or_hf_repo=MODEL)
+        except Exception as exc:
+            self.last_error = f"No se pudo cargar Whisper: {exc}"
+            print(self.last_error, flush=True)
+            sound("Basso")
+        finally:
+            self.state = "idle"
 
     def _transcribe(self, audio: np.ndarray) -> None:
         try:
@@ -323,13 +371,16 @@ class Dictado:
             )
             text = clean(result["text"])
             if text:
+                text = polish_locally(text)
                 self.last_text = text
-                CFG_DIR.mkdir(exist_ok=True)
-                with LOG_FILE.open("a") as f:
-                    f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}\n")
+                if self.cfg.get("history", True):
+                    CFG_DIR.mkdir(exist_ok=True)
+                    with LOG_FILE.open("a") as f:
+                        f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}\n")
                 paste(text)
         except Exception as exc:
-            print("Error transcribiendo:", exc, flush=True)
+            self.last_error = f"Error transcribiendo: {exc}"
+            print(self.last_error, flush=True)
             sound("Basso")
         finally:
             self.state = "idle"
@@ -419,9 +470,46 @@ class Delegate(NSObject):
         save_cfg(D.cfg)
         self.refresh_checks()
 
+    def setDevice_(self, sender):
+        D.cfg["device"] = sender.representedObject()
+        save_cfg(D.cfg)
+        self.refresh_checks()
+
+    def toggleHistory_(self, _sender):
+        D.cfg["history"] = not D.cfg.get("history", True)
+        save_cfg(D.cfg)
+        self.refresh_checks()
+
+    def toggleSounds_(self, _sender):
+        D.cfg["sounds"] = not D.cfg.get("sounds", True)
+        save_cfg(D.cfg)
+        self.refresh_checks()
+
+    def toggleClipboard_(self, _sender):
+        D.cfg["restore_clipboard"] = not D.cfg.get("restore_clipboard", True)
+        save_cfg(D.cfg)
+        self.refresh_checks()
+
+    def togglePolish_(self, _sender):
+        D.cfg["polish"] = not D.cfg.get("polish", False)
+        if D.cfg["polish"] and not shutil.which("ollama"):
+            D.last_error = "Instala Ollama para activar la limpieza inteligente local."
+            D.cfg["polish"] = False
+            sound("Basso")
+        save_cfg(D.cfg)
+        self.refresh_checks()
+
     def pasteLast_(self, _sender):
         if D.last_text:
             threading.Thread(target=paste, args=(D.last_text,), daemon=True).start()
+
+    def copyLast_(self, _sender):
+        if D.last_text:
+            subprocess.run(["pbcopy"], input=D.last_text.encode())
+            sound("Tink")
+
+    def undoLast_(self, _sender):
+        send_command_key(6)  # 6 = tecla Z
 
     def openHistory_(self, _sender):
         LOG_FILE.touch()
@@ -439,6 +527,12 @@ class Delegate(NSObject):
             it.setState_(1 if it.representedObject() == D.cfg["lang"] else 0)
         for it in self.key_items:
             it.setState_(1 if it.representedObject() == D.cfg["key"] else 0)
+        for it in self.device_items:
+            it.setState_(1 if it.representedObject() == D.cfg.get("device") else 0)
+        self.history_item.setState_(1 if D.cfg.get("history", True) else 0)
+        self.sounds_item.setState_(1 if D.cfg.get("sounds", True) else 0)
+        self.clipboard_item.setState_(1 if D.cfg.get("restore_clipboard", True) else 0)
+        self.polish_item.setState_(1 if D.cfg.get("polish", False) else 0)
 
 
 def add_item(menu, title, action=None, target=None, obj=None):
@@ -497,13 +591,28 @@ def main() -> None:
     menu = NSMenu.alloc().init()
     add_item(menu, "Mantén la tecla y habla · pulsación corta = bloquear").setEnabled_(False)
     menu.addItem_(NSMenuItem.separatorItem())
-    lang_menu, key_menu = NSMenu.alloc().init(), NSMenu.alloc().init()
+    lang_menu, key_menu, device_menu = NSMenu.alloc().init(), NSMenu.alloc().init(), NSMenu.alloc().init()
     delegate.lang_items = [add_item(lang_menu, n, "setLang:", delegate, k) for k, n in LANGS.items()]
     delegate.key_items = [add_item(key_menu, v["name"], "setKey:", delegate, k) for k, v in KEYS.items()]
+    delegate.device_items = [add_item(device_menu, "Predeterminado del sistema", "setDevice:", delegate, None)]
+    try:
+        for index, device in enumerate(sd.query_devices()):
+            if device["max_input_channels"] > 0:
+                delegate.device_items.append(add_item(device_menu, device["name"], "setDevice:", delegate, index))
+    except Exception as exc:
+        D.last_error = f"No se pudieron listar microfonos: {exc}"
     add_item(menu, "Idioma").setSubmenu_(lang_menu)
     add_item(menu, "Tecla de dictado").setSubmenu_(key_menu)
+    add_item(menu, "Microfono").setSubmenu_(device_menu)
+    menu.addItem_(NSMenuItem.separatorItem())
+    delegate.polish_item = add_item(menu, "Limpieza inteligente local (Ollama)", "togglePolish:", delegate)
+    delegate.history_item = add_item(menu, "Guardar historial local", "toggleHistory:", delegate)
+    delegate.clipboard_item = add_item(menu, "Restaurar portapapeles", "toggleClipboard:", delegate)
+    delegate.sounds_item = add_item(menu, "Sonidos", "toggleSounds:", delegate)
     menu.addItem_(NSMenuItem.separatorItem())
     add_item(menu, "Pegar último texto", "pasteLast:", delegate)
+    add_item(menu, "Copiar último texto", "copyLast:", delegate)
+    add_item(menu, "Deshacer último pegado", "undoLast:", delegate)
     add_item(menu, "Abrir historial", "openHistory:", delegate)
     add_item(menu, "Editar diccionario", "openDict:", delegate)
     menu.addItem_(NSMenuItem.separatorItem())
